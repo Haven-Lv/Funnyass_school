@@ -74,9 +74,16 @@
 - 微信小程序版本。
 - 启动时自动重连上次设备（可在后续版本加入）。
 
+## 下载
+
+见 [Releases](https://github.com/Haven-Lv/Funnyass_school/releases)：
+
+- `Ruizhi-Campus-0.1920.apk`：调试签名，arm64-v8a，minSdk 24，SHA-256 `060D6F67C8367148D897FDA113233753B40A3E0D8D306DDF60E6B0165475663C`。
+- 与上游作者版本的签名不同，覆盖安装官方包前需要先卸载；与本 fork 之前的 0.1919 版同签名，可直接覆盖升级。
+
 ## 使用方法
 
-1. 使用 Android Studio 构建，或安装自行编译的 APK（本仓库不附带预编译包）。
+1. 从 [Releases](https://github.com/Haven-Lv/Funnyass_school/releases) 下载 `Ruizhi-Campus-0.1920.apk` 安装；也可以用 Android Studio 自行构建。
 2. 打开“睿智校园”，使用校园账户登录。
 3. 按系统提示授予蓝牙或“附近的设备”权限，并确保蓝牙已开启。
 4. 点击「扫描附近设备」。首次使用建议先比对官方 App 里显示的 MAC（如 `C4:7F:0E:20:5B:79`），确认是自己的表；也可以直接把 MAC 填进输入框后点「连接设备」。
