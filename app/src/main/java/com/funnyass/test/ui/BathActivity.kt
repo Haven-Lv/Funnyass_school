@@ -4,6 +4,9 @@ import android.annotation.SuppressLint
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -24,6 +27,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.funnyass.test.CmdServer
+import com.funnyass.test.DeviceDirectory
+import com.funnyass.test.DeviceRecord
+import com.funnyass.test.Favorites
 import com.funnyass.test.Logger
 import com.funnyass.test.R
 import com.funnyass.test.ble.BleManager
@@ -65,12 +71,26 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     private lateinit var stopBtn: Button
     private lateinit var disconnectBtn: Button
     private lateinit var reloginBtn: Button
+    private lateinit var exportLogBtn: TextView
+    private lateinit var logToggleBtn: TextView
+    private lateinit var logClearBtn: TextView
+    private lateinit var favToggle: TextView
+    private lateinit var favList: LinearLayout
 
     private var user: UserInfo? = null
     private var device: DeviceInfo? = null
-    private val devices = LinkedHashMap<String, BluetoothDevice>()
     private lateinit var adapter: ArrayAdapter<String>
     private var selectedMac: String? = null
+
+    // 扫描结果（mac → 条目），列表按「收藏 → 已保存 → 信号强度」渲染
+    private val scanEntries = LinkedHashMap<String, ScanEntry>()
+    private val visibleMacs = mutableListOf<String>()
+    private var lastScanRenderAt = 0L
+
+    // 六态连接状态机
+    private enum class LinkState { IDLE, SELECTED, CONNECTING, LINKED, READY, FAILED, DISCONNECTED }
+    private var linkState = LinkState.IDLE
+    private var linkDetail = ""
 
     private var protocolType = "20"
     private var randomNumber = ""
@@ -88,6 +108,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     private var stopAttempts = 0
     private var settlementInFlight = false
     private var collectRequested = false
+    private var settlePending = false
     private var authRedirected = false
     private var authInvalidPending = false
     @Volatile private var sessionCheckInFlight = false
@@ -99,6 +120,14 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         override fun run() {
             validateSessionSilently()
             opHandler.postDelayed(this, SESSION_CHECK_INTERVAL_MS)
+        }
+    }
+
+    /** 运行日志面板刷新（只看内存缓冲尾部，1.5s 一次） */
+    private val logTicker = object : Runnable {
+        override fun run() {
+            refreshLog()
+            opHandler.postDelayed(this, LOG_REFRESH_MS)
         }
     }
 
@@ -123,6 +152,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_bath)
+        Logger.init(this)
         statusTv = findViewById(R.id.status)
         logTv = findViewById(R.id.log)
         deviceList = findViewById(R.id.device_list)
@@ -145,11 +175,16 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         stopBtn = findViewById(R.id.stop_btn)
         disconnectBtn = findViewById(R.id.disconnect_btn)
         reloginBtn = findViewById(R.id.relogin_btn)
+        exportLogBtn = findViewById(R.id.export_log)
+        logToggleBtn = findViewById(R.id.log_toggle)
+        logClearBtn = findViewById(R.id.log_clear)
+        favToggle = findViewById(R.id.fav_toggle)
+        favList = findViewById(R.id.fav_list)
 
         adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1)
         deviceList.adapter = adapter
         deviceList.setOnItemClickListener { _, _, pos, _ ->
-            val mac = devices.keys.elementAtOrNull(pos) ?: return@setOnItemClickListener
+            val mac = visibleMacs.getOrNull(pos) ?: return@setOnItemClickListener
             device = null
             selectedMac = mac
             macInput.setText(mac)
@@ -187,6 +222,10 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         stopBtn.setOnClickListener { stopBath() }
         disconnectBtn.setOnClickListener { disconnectDev() }
         reloginBtn.setOnClickListener { requestRelogin() }
+        exportLogBtn.setOnClickListener { showExportLogDialog() }
+        logToggleBtn.setOnClickListener { toggleLogging() }
+        logClearBtn.setOnClickListener { confirmClearLog() }
+        favToggle.setOnClickListener { toggleFavorite() }
         findViewById<TextView>(R.id.refresh_btn).setOnClickListener { refreshUser() }
         advancedToggle.setOnClickListener {
             val expanded = advancedPanel.visibility != View.VISIBLE
@@ -195,6 +234,10 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         }
 
         refreshUser()
+        renderFavorites()
+        updateFavToggle()
+        updateLogControls()
+        refreshLog()
         CmdServer.start(this)
         scanDevices()
     }
@@ -203,10 +246,13 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         super.onResume()
         opHandler.removeCallbacks(sessionCheck)
         opHandler.post(sessionCheck)
+        opHandler.removeCallbacks(logTicker)
+        opHandler.post(logTicker)
     }
 
     override fun onPause() {
         opHandler.removeCallbacks(sessionCheck)
+        opHandler.removeCallbacks(logTicker)
         super.onPause()
     }
 
@@ -251,25 +297,48 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     }
 
     private fun renderConnection() {
-        connectionValueTv.text = if (connected) "已连接" else "未连接"
-        connectionValueTv.setTextColor(ContextCompat.getColor(this,
-            if (connected) R.color.miui_green else R.color.miui_text))
+        val text = when (linkState) {
+            LinkState.IDLE -> "未选择"
+            LinkState.SELECTED -> "已选择"
+            LinkState.CONNECTING -> "连接中…"
+            LinkState.LINKED -> "已连接·读状态"
+            LinkState.READY -> "已连接"
+            LinkState.FAILED -> "连接失败"
+            LinkState.DISCONNECTED -> "已断开"
+        }
+        val color = when (linkState) {
+            LinkState.READY -> R.color.miui_green
+            LinkState.CONNECTING, LinkState.LINKED -> R.color.miui_blue
+            else -> R.color.miui_text
+        }
+        connectionValueTv.text = text
+        connectionValueTv.setTextColor(ContextCompat.getColor(this, color))
         val hint = when {
             stopRequestInFlight -> "关阀命令已直接发送；关阀后再进行消费结算"
-            settlementInFlight || deviceState == 3 -> "供水已经停止，正在完成消费结算"
+            settlementInFlight -> "供水已经停止，正在完成消费结算"
+            settlePending -> "已停止供水；未用完的预扣会在下次连接后自动结算退回"
+            deviceState == 3 -> "供水已经停止，正在完成消费结算"
             isOwnActiveSession() -> "设备正在供水，点击停止会立即发送关阀命令"
             deviceState == 1 -> "设备正被其他账户使用，已禁止误操作"
             connected && deviceState == 0 && device == null -> "设备状态正常，正在等待设备详情"
             connected && deviceState == 0 -> "设备状态已确认，可以开始洗澡"
             connected -> "正在读取设备状态，请稍候"
+            linkState == LinkState.CONNECTING || linkState == LinkState.LINKED ->
+                "正在建立连接：" + (linkDetail.ifEmpty { "请稍候" }) + "（失败会自动重试 1 次）"
+            linkState == LinkState.FAILED ->
+                "连接失败：" + (linkDetail.ifEmpty { "未知原因" }) + "（点「连接设备」重试，不必杀进程）"
+            linkState == LinkState.SELECTED -> "已选择设备，点「连接设备」开始连接"
+            linkState == LinkState.DISCONNECTED -> "连接已断开，点「连接设备」重新连接"
             else -> "连接设备后即可开始，停止时会自动结算"
         }
         controlHintTv.text = hint
         renderDevice()
         updateActionButtons()
+        updateFavToggle()
     }
 
     private fun setStatusText(text: String) {
+        Logger.log("[ui] " + text)
         statusTv.text = text
         val active = connected && (text.contains("使用") || text.contains("结算") || text.contains("关阀"))
         statusTv.setTextColor(ContextCompat.getColor(this,
@@ -295,12 +364,13 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
             pendingRateDate == null && device != null
         val canStop = connected && isOwnActiveSession() && !stopRequestInFlight && !settlementInFlight
         val canChangeDevice = !operationLocksDevice()
+        val connectingNow = linkState == LinkState.CONNECTING || linkState == LinkState.LINKED
         val canReconnectLockedDevice = !connected && !selectedMac.isNullOrBlank() && operationLocksDevice()
 
         startBtn.isEnabled = canStart
         stopBtn.isEnabled = canStop
-        connectBtn.isEnabled = canChangeDevice || canReconnectLockedDevice
-        scanBtn.isEnabled = canChangeDevice
+        connectBtn.isEnabled = (canChangeDevice || canReconnectLockedDevice) && !connectingNow
+        scanBtn.isEnabled = canChangeDevice && !connectingNow
         disconnectBtn.isEnabled = connected && canChangeDevice
         reloginBtn.isEnabled = !isOwnActiveSession() && !stopRequestInFlight && !startRequestInFlight
         macInput.isEnabled = canChangeDevice
@@ -328,6 +398,12 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                 runOnUiThread {
                     if (r.errorCode == 0 && r.data != null) {
                         device = r.data
+                        // 记住这台表的房间名，下次扫描直接显示，不用再一个个试
+                        DeviceDirectory.remember(this, mac, r.data, protocolType)
+                        favoriteLabel()?.let { Favorites.rename(this, mac, it) }
+                        renderScanList()
+                        renderFavorites()
+                        updateFavToggle()
                         renderDevice()
                         updateActionButtons()
                     } else {
@@ -413,11 +489,18 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     // ---- CmdServer.Commands ----
     override fun connectDevice(mac: String) {
         if (mac.isEmpty()) { Logger.log("connect 需要 mac"); return }
+        if (linkState == LinkState.CONNECTING || linkState == LinkState.LINKED) {
+            toast("正在连接中，请稍候")
+            return
+        }
         val reconnectingLockedDevice = !connected && selectedMac?.equals(mac, ignoreCase = true) == true
         if (operationLocksDevice() && !reconnectingLockedDevice) {
             toast("当前用水或结算尚未结束，不能更换设备")
             return
         }
+        linkState = LinkState.SELECTED
+        linkDetail = ""
+        settlePending = false
         deviceState = -1
         deviceAccountId = 0
         randomNumber = ""
@@ -459,8 +542,11 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         randomNumber = ""
         selectedMac = null
         macInput.text.clear()
-        devices.clear()
-        adapter.clear()
+        scanEntries.clear()
+        visibleMacs.clear()
+        linkState = LinkState.IDLE
+        linkDetail = ""
+        renderScanList()
         renderDevice()
         setStatusText("正在扫描附近设备…")
         ble.startScan()
@@ -476,7 +562,73 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
             toast("当前用水或结算尚未结束，不能断开设备")
             return
         }
-        ble.disconnect(); connected = false; Logger.status("已断开"); setStatusText("已断开")
+        ble.disconnect(); connected = false; linkState = LinkState.DISCONNECTED; linkDetail = ""
+        Logger.status("已断开"); setStatusText("已断开")
+    }
+
+    // ---------------- 运行日志导出 ----------------
+
+    private fun showExportLogDialog() {
+        val items = arrayOf(
+            "保存为文件（推荐，可直接发给我）",
+            "复制全部到剪贴板"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("导出运行日志")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> saveLogToFile()
+                    1 -> copyLogToClipboard()
+                }
+            }
+            .show()
+    }
+
+    private fun saveLogToFile() {
+        val name = Logger.exportFileName()
+        try {
+            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TITLE, name)
+            }
+            startActivityForResult(intent, REQUEST_SAVE_LOG)
+        } catch (e: Exception) {
+            Logger.log("打开文件保存器失败: " + e.message)
+            toast("系统没有文件选择器，已改为复制日志")
+            copyLogToClipboard()
+        }
+    }
+
+    private fun writeLogToUri(uri: android.net.Uri) {
+        val text = Logger.exportText(this, "界面导出")
+        Thread {
+            val ok = try {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(text.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                }
+                true
+            } catch (e: Exception) {
+                Logger.log("导出日志失败: " + e.message)
+                false
+            }
+            runOnUiThread {
+                toast(if (ok) "日志已保存，可直接发送" else "日志保存失败")
+                Logger.log("导出日志" + (if (ok) "成功" else "失败"))
+            }
+        }.start()
+    }
+
+    private fun copyLogToClipboard() {
+        try {
+            val text = Logger.exportText(this, "剪贴板导出")
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("睿智校园日志", text))
+            toast("日志已复制（" + text.length + " 字）")
+        } catch (e: Exception) {
+            toast("复制失败: " + e.message)
+        }
     }
 
     override fun queryDev() {
@@ -756,6 +908,11 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     @Deprecated("Bluetooth enable result uses the platform activity result API")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_SAVE_LOG) {
+            val uri = data?.data
+            if (resultCode == RESULT_OK && uri != null) writeLogToUri(uri) else toast("已取消保存")
+            return
+        }
         if (requestCode == 101) {
             if (ble.isEnabled) beginScan() else setStatusText("蓝牙未开启")
         }
@@ -778,29 +935,244 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         }.start()
     }
 
-    override fun onScanResult(device: BluetoothDevice, rssi: Int) {
-        val mac = device.address
-        val isNew = !devices.containsKey(mac)
-        devices[mac] = device
-        if (isNew) {
-            val n = try { device.name?.takeIf { it.isNotBlank() } ?: "未命名设备" }
-                catch (_: Exception) { "未命名设备" }
-            adapter.add(n + "  ·  " + rssi + " dBm\n" + mac)
+    override fun onScanResult(device: BluetoothDevice, rssi: Int, name: String?) {
+        val mac = DeviceDirectory.norm(device.address)
+        if (mac.isEmpty()) return
+        val old = scanEntries[mac]
+        val mergedName = name?.takeIf { it.isNotBlank() } ?: old?.name
+        if (old == null) {
+            val saved = DeviceDirectory.lookup(this, mac)
+            Logger.log(
+                "扫描到 " + mac + " rssi=" + rssi +
+                    " 广播名=" + (name ?: "-") +
+                    " 档案=" + (saved?.label()?.ifEmpty { "-" } ?: "-")
+            )
         }
+        scanEntries[mac] = ScanEntry(mac, mergedName, rssi, System.currentTimeMillis())
+        if (System.currentTimeMillis() - lastScanRenderAt >= SCAN_RENDER_INTERVAL_MS) {
+            renderScanList()
+        }
+    }
+
+    /** 列表行：收藏 → 已保存 → 信号强度，全部展开不再折叠 */
+    private fun renderScanList() {
+        lastScanRenderAt = System.currentTimeMillis()
+        val dir = DeviceDirectory.load(this)
+        val favKeys = Favorites.load(this).map { DeviceDirectory.norm(it.mac) }.toSet()
+        val rows = scanEntries.values.sortedWith(
+            compareBy<ScanEntry> { if (favKeys.contains(it.mac)) 0 else 1 }
+                .thenBy { if (dir.containsKey(it.mac)) 0 else 1 }
+                .thenByDescending { it.rssi }
+        )
+        adapter.clear()
+        visibleMacs.clear()
+        for (e in rows) addScanRow(e, dir[e.mac])
+    }
+
+    private fun addScanRow(e: ScanEntry, rec: DeviceRecord?) {
+        val label = rec?.label()?.takeIf { it.isNotEmpty() }
+            ?: e.name?.takeIf { it.isNotEmpty() }
+            ?: "未命名设备"
+        val tail = if (rec != null) "  ·  已保存" else ""
+        adapter.add(label + "  ·  " + e.rssi + " dBm\n" + e.mac + tail)
+        visibleMacs.add(e.mac)
+    }
+
+    // ---------------- 收藏设备 ----------------
+
+    private fun favoriteMac(): String? {
+        val key = DeviceDirectory.norm(selectedMac)
+        return key.ifEmpty { null }
+    }
+
+    private fun favoriteLabel(): String? {
+        val d = device
+        return d?.roomName?.takeIf { it.isNotBlank() }
+            ?: d?.devName?.takeIf { it.isNotBlank() }
+            ?: DeviceDirectory.lookup(this, selectedMac)?.label()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun toggleFavorite() {
+        if (linkState != LinkState.READY) {
+            toast("连接成功后才能收藏")
+            return
+        }
+        val mac = favoriteMac()
+        if (mac == null) {
+            toast("请先选择设备")
+            return
+        }
+        if (Favorites.isFavorite(this, mac)) {
+            Favorites.remove(this, mac)
+            toast("已取消收藏")
+        } else {
+            Favorites.add(this, mac, favoriteLabel())
+            toast("已收藏，下次可在「收藏设备」里直接点")
+        }
+        renderFavorites()
+        updateFavToggle()
+        renderScanList()
+    }
+
+    private fun updateFavToggle() {
+        if (!::favToggle.isInitialized) return
+        val mac = favoriteMac()
+        val ready = linkState == LinkState.READY
+        val fav = mac != null && Favorites.isFavorite(this, mac)
+        favToggle.text = when {
+            !ready -> "☆ 收藏该设备（连接成功后可用）"
+            fav -> "★ 已收藏 · 点此取消收藏"
+            else -> "☆ 收藏该设备"
+        }
+        favToggle.alpha = if (ready) 1f else 0.45f
+    }
+
+    private fun renderFavorites() {
+        if (!::favList.isInitialized) return
+        favList.removeAllViews()
+        val list = Favorites.load(this)
+        if (list.isEmpty()) {
+            favList.addView(hintText("还没有收藏。连接成功一台设备后，点设备卡片里的「☆ 收藏该设备」即可固定在这里。"))
+            return
+        }
+        for (fav in list) {
+            val mac = DeviceDirectory.norm(fav.mac)
+            if (mac.isEmpty()) continue
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(0, dp(8), 0, dp(8))
+                isClickable = true
+                setOnClickListener { connectDevice(mac) }
+            }
+            val col = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+                )
+            }
+            val name = TextView(this).apply {
+                text = fav.name().ifEmpty { mac }
+                textSize = 14f
+                setTextColor(ContextCompat.getColor(this@BathActivity, R.color.miui_text))
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            }
+            val macTv = TextView(this).apply {
+                text = mac
+                textSize = 11f
+                setTextColor(ContextCompat.getColor(this@BathActivity, R.color.miui_tertiary))
+            }
+            col.addView(name)
+            col.addView(macTv)
+            val cancel = TextView(this).apply {
+                text = "取消收藏"
+                textSize = 12f
+                setTextColor(ContextCompat.getColor(this@BathActivity, R.color.miui_blue))
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+                isClickable = true
+                setOnClickListener {
+                    Favorites.remove(this@BathActivity, mac)
+                    renderFavorites()
+                    updateFavToggle()
+                    renderScanList()
+                    toast("已取消收藏")
+                }
+            }
+            row.addView(col)
+            row.addView(cancel)
+            favList.addView(row)
+        }
+    }
+
+    private fun hintText(s: String): TextView = TextView(this).apply {
+        text = s
+        textSize = 12f
+        setTextColor(ContextCompat.getColor(this@BathActivity, R.color.miui_tertiary))
+        setPadding(0, dp(4), 0, dp(2))
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    // ---------------- 日志开关 ----------------
+
+    private fun toggleLogging() {
+        val next = !Logger.isEnabled()
+        Logger.setEnabled(this, next)
+        updateLogControls()
+        refreshLog()
+        toast(if (next) "日志已开启，重启后仍会继续记录" else "日志已关闭，已记录的日志保留")
+    }
+
+    private fun updateLogControls() {
+        if (!::logToggleBtn.isInitialized) return
+        val on = Logger.isEnabled()
+        logToggleBtn.text = if (on) "关闭日志" else "开启日志"
+        logToggleBtn.setTextColor(ContextCompat.getColor(this,
+            if (on) R.color.miui_green else R.color.miui_blue))
+    }
+
+    private fun confirmClearLog() {
+        AlertDialog.Builder(this)
+            .setTitle("清空日志")
+            .setMessage("会删除本机已记录的全部日志（含历史文件），无法恢复。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("清空") { _, _ ->
+                Logger.clearAll(this)
+                refreshLog()
+                toast("日志已清空")
+            }
+            .show()
+    }
+
+    private fun refreshLog() {
+        if (!::logTv.isInitialized) return
+        if (!Logger.isEnabled()) {
+            logTv.text = "日志未开启。\n点上方「开启日志」开始记录；开启状态会自动保存，杀进程重进仍继续记录。"
+            return
+        }
+        val text = Logger.snapshot(LOG_PANEL_LINES)
+        logTv.text = if (text.isEmpty()) "日志已开启，暂时还没有内容…" else text
     }
 
     override fun onStateChanged(state: Int, msg: String) {
         Logger.status(msg)
         when (state) {
-            3 -> {
+            BleManager.S_CONNECTING -> {
+                linkState = LinkState.CONNECTING
+                linkDetail = msg
+                setStatusText("连接中…")
+            }
+            BleManager.S_RETRYING -> {
+                linkState = LinkState.CONNECTING
+                linkDetail = msg
+                setStatusText("连接失败，正在自动重试…")
+            }
+            BleManager.S_LINKED -> {
+                linkState = LinkState.LINKED
+                linkDetail = msg
+                setStatusText("已连接，正在发现服务…")
+            }
+            BleManager.S_READY -> {
+                linkState = LinkState.READY
+                linkDetail = ""
                 connected = true
                 advancedPanel.visibility = View.GONE
                 advancedToggle.text = "更换洗澡设备  ›"
+                DeviceDirectory.remember(this, selectedMac, device, protocolType)
+                favoriteLabel()?.let { Favorites.rename(this, selectedMac, it) }
+                renderScanList()
+                renderFavorites()
+                updateFavToggle()
                 setStatusText("已连接，正在确认设备状态…")
                 Logger.log("发送查询 0x23")
                 ble.send(0x23)
             }
-            4 -> {
+            BleManager.S_DISCONNECTED -> {
+                linkState = when (linkState) {
+                    LinkState.READY, LinkState.DISCONNECTED -> LinkState.DISCONNECTED
+                    else -> LinkState.FAILED
+                }
+                linkDetail = msg
                 connected = false
                 opHandler.removeCallbacks(startAckTimeout)
                 opHandler.removeCallbacks(startVerifyTimeout)
@@ -816,8 +1188,21 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                 }
                 Logger.status("已断开")
             }
-            11 -> setStatusText(if (devices.isEmpty()) "未发现设备，请重试" else "请选择附近设备")
-            else -> setStatusText(msg)
+            BleManager.S_FAILED, BleManager.S_ERROR -> {
+                linkState = LinkState.FAILED
+                linkDetail = msg
+                connected = false
+                DeviceDirectory.noteFail(this, selectedMac)
+                setStatusText(msg)
+            }
+            BleManager.S_SCAN_DONE -> {
+                renderScanList()
+                setStatusText(if (scanEntries.isEmpty()) "未发现设备，请重试" else "请选择附近设备")
+            }
+            else -> {
+                if (state == BleManager.S_SCANNING) renderScanList()
+                setStatusText(msg)
+            }
         }
         renderConnection()
     }
@@ -861,6 +1246,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                     Logger.log("存储写回完成")
                     settlementInFlight = false
                     collectRequested = false
+                    settlePending = false
                     deviceState = 0
                     deviceAccountId = 0
                     clearPendingRate()
@@ -872,7 +1258,8 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                     Logger.log("存储写回失败 payload=" + FrameUtils.toHex(payload))
                     settlementInFlight = false
                     collectRequested = false
-                    setStatusText("已关阀，设备记录待重试")
+                    setStatusText("已停止供水")
+                    settlePending = true
                 }
             }
             0xF8, 0x50 -> Logger.log("密钥设置回执")
@@ -891,7 +1278,8 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
             0x85, 0x86 -> {
                 settlementInFlight = false
                 collectRequested = false
-                setStatusText("已关阀，结算通信失败，请重连重试")
+                setStatusText("已停止供水")
+                settlePending = true
             }
         }
     }
@@ -1105,12 +1493,15 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                 val r: BaseResponse<UploadData> = Api.uploadBluetoothData(u, protocolType, randomNumber, xfData)
                 runOnUiThread {
                     if (r.errorCode in setOf(0, 206, 209) && r.data != null) {
+                        settlePending = false
                         val clData = r.data.clData ?: ""
+                        Logger.log("上传消费成功 code=" + r.errorCode + " clData长度=" + clData.length + " 金额(分)=" + r.data.upMoney)
                         val plain = try { JniUtils.decryptByAES(clData) } catch (e: Exception) { "" }
                         val dataHex = plain.substringAfter("-", "")
                         if (dataHex.isBlank() || FrameUtils.fromHex(dataHex) == null) {
                             settlementInFlight = false
-                            setStatusText("已关阀，结算写回数据无效")
+                            setStatusText("已停止供水")
+                            settlePending = true
                             Logger.log("结算响应无法解密或格式无效")
                             updateActionButtons()
                             return@runOnUiThread
@@ -1121,18 +1512,15 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                         Logger.log("写回设备存储 0x86")
                         ble.sendRawHex(0x86, dataHex)
                     } else {
-                        settlementInFlight = false
-                        collectRequested = false
-                        setStatusText("已关阀，消费记录上传失败，请重连重试")
-                        Logger.log("上传失败: " + r.errorCode + " " + r.errorMessage + " data=" + r.data)
-                        updateActionButtons()
+                        handleSettleFailed(r.errorCode, r.errorMessage)
                     }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
                     settlementInFlight = false
                     collectRequested = false
-                    setStatusText("已关阀，消费记录上传失败，请重连重试")
+                    setStatusText("已停止供水")
+                    settlePending = true
                     Logger.log("上传异常: " + e.message)
                     updateActionButtons()
                 }
@@ -1140,11 +1528,27 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         }.start()
     }
 
+    /**
+     * 结算上传未通过（例如 226）。
+     * 现状约定：预扣在开始洗澡时一次扣完，未用完的金额在下次连接后随结算自动退回，
+     * 所以这里只把界面收敛成「已停止供水」，不再显示「上传失败」。
+     */
+    private fun handleSettleFailed(code: Int, message: String?) {
+        Logger.log("上传失败: " + code + " " + message)
+        settlementInFlight = false
+        collectRequested = false
+        settlePending = true
+        Logger.status("已停止供水 · 待下次连接结算")
+        setStatusText("已停止供水")
+        updateActionButtons()
+    }
+
     override fun onDestroy() {
         opHandler.removeCallbacksAndMessages(null)
         ApiClient.clearAuthInvalidListener(authInvalidListener)
         CmdServer.detach(this)
         ble.listener = null
+        ble.disconnect()
         super.onDestroy()
     }
 
@@ -1158,7 +1562,20 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         private const val STOP_VERIFY_TIMEOUT_MS = 2_500L
         private const val MAX_STOP_ATTEMPTS = 2
         private const val SESSION_CHECK_INTERVAL_MS = 30_000L
+
+        private const val LOG_REFRESH_MS = 1_500L
+        private const val LOG_PANEL_LINES = 300
+        private const val SCAN_RENDER_INTERVAL_MS = 700L
+        private const val REQUEST_SAVE_LOG = 102
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 }
+
+/** 扫描结果条目：显示名与最近一次信号强度 */
+private data class ScanEntry(
+    val mac: String,
+    val name: String?,
+    val rssi: Int,
+    val seenAt: Long
+)

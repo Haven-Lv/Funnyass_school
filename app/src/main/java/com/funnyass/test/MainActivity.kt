@@ -10,6 +10,7 @@ import com.funnyass.test.ui.LoginActivity
 class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Logger.init(this)
         val user = Session.loadUser(this)
         val target = if (user != null) BathActivity::class.java else LoginActivity::class.java
         startActivity(Intent(this, target))
