@@ -50,6 +50,7 @@ class BleManager(private val ctx: Context) {
         const val S_SCAN_DONE = 11
 
         private const val CONNECT_TIMEOUT_MS = 15_000L
+        private const val STAGE_TIMEOUT_MS = 10_000L
         private const val MAX_ATTEMPTS = 2
         private const val RETRY_DELAY_MS = 1_500L
         private const val SCAN_TIMEOUT_MS = 12_000L
@@ -79,6 +80,12 @@ class BleManager(private val ctx: Context) {
     @Volatile private var connecting = false
     @Volatile private var attempt = 0
     @Volatile private var lastMac: String? = null
+    /**
+     * 用户主动断开（或上层要求释放设备）的闩锁：
+     * 置位后所有「自动重试 / 延迟重连」一律作废，只有下一次显式 connect() 才会清除。
+     * 解决「断开后又被自动连回去」的问题。
+     */
+    @Volatile private var manualStop = false
 
     val isEnabled: Boolean get() = adapter?.isEnabled == true
     val isConnected: Boolean get() = gatt != null && !connecting
@@ -157,6 +164,7 @@ class BleManager(private val ctx: Context) {
             return
         }
         stopScan()
+        manualStop = false
         lastMac = target
         attempt = 0
         connecting = true
@@ -203,12 +211,26 @@ class BleManager(private val ctx: Context) {
         }
     }
 
+    /** GATT 已连上但服务发现 / 开启通知迟迟不回调时的兜底，避免界面一直停在“连接中” */
+    private val stageTimeout = Runnable {
+        if (connecting) {
+            Logger.log("BLE 服务发现/通知开启超时（" + STAGE_TIMEOUT_MS + "ms）")
+            closeGatt()
+            connecting = false
+            emit(S_FAILED, "连接超时（服务发现/通知开启）")
+        }
+    }
+
     private fun retryOrFail(reason: String) {
+        if (manualStop) {
+            connecting = false
+            return
+        }
         if (attempt < MAX_ATTEMPTS) {
             val next = attempt + 1
             emit(S_RETRYING, "第 " + attempt + " 次失败（" + reason + "），准备第 " + next + " 次")
             main.postDelayed({
-                if (!connecting) return@postDelayed
+                if (!connecting || manualStop) return@postDelayed
                 val dev = try {
                     lastMac?.let { adapter?.getRemoteDevice(it) }
                 } catch (_: Exception) {
@@ -229,6 +251,7 @@ class BleManager(private val ctx: Context) {
 
     private fun closeGatt() {
         main.removeCallbacks(connectTimeout)
+        main.removeCallbacks(stageTimeout)
         val g = gatt ?: run {
             writeChar = null
             return
@@ -247,6 +270,8 @@ class BleManager(private val ctx: Context) {
     }
 
     fun disconnect() {
+        // 手动/主动释放：闩住自动重试，直到下一次显式 connect()
+        manualStop = true
         connecting = false
         attempt = 0
         closeGatt()
@@ -328,6 +353,8 @@ class BleManager(private val ctx: Context) {
                         closeGatt()
                         emit(S_ERROR, "发现服务失败")
                     }
+                    main.removeCallbacks(stageTimeout)
+                    main.postDelayed(stageTimeout, STAGE_TIMEOUT_MS)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Logger.log("GATT 已断开 status=" + status)
@@ -374,6 +401,7 @@ class BleManager(private val ctx: Context) {
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            main.removeCallbacks(stageTimeout)
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 connecting = false
                 attempt = 0

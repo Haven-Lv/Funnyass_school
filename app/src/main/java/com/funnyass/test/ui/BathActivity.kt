@@ -109,6 +109,10 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     private var settlementInFlight = false
     private var collectRequested = false
     private var settlePending = false
+    // 「设备被别人占用」弹窗与强制关阀状态
+    private var forceStopDialogShowing = false
+    private var forceStopOtherInFlight = false
+    private var forceStopAttempts = 0
     private var authRedirected = false
     private var authInvalidPending = false
     @Volatile private var sessionCheckInFlight = false
@@ -793,6 +797,82 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         }
     }
 
+    private fun myAccountId(): Int = user?.accountId ?: 0
+
+    /**
+     * 主动释放 BLE 连接：
+     * 1) 不再占着水表，别人才能连；
+     * 2) BleManager 里会闩住自动重试，断开后不会自己连回去（只有用户再点「连接设备」才会连）。
+     */
+    private fun releaseDevice(reason: String) {
+        Logger.log("释放设备：" + reason)
+        ble.disconnect()
+        connected = false
+        linkState = LinkState.DISCONNECTED
+        linkDetail = reason
+        renderConnection()
+    }
+
+    // ---------------- 设备被他人占用：确认是否强制停止 ----------------
+
+    private val forceStopTimeout = Runnable {
+        if (!forceStopOtherInFlight) return@Runnable
+        if (forceStopAttempts < 1) {
+            forceStopAttempts++
+            Logger.log("强制关阀无回执，重试 0x22")
+            ble.send(0x22)
+            startForceStopTimeout()
+        } else {
+            forceStopOtherInFlight = false
+            Logger.log("强制关阀失败（无回执）")
+            setStatusText("强制停止未确认，请重试")
+            toast("强制停止未确认，请重试或让对方自行停止")
+            releaseDevice("强制停止失败")
+        }
+    }
+
+    private fun startForceStopTimeout() {
+        opHandler.removeCallbacks(forceStopTimeout)
+        opHandler.postDelayed(forceStopTimeout, FORCE_STOP_TIMEOUT_MS)
+    }
+
+    private fun showForceStopDialog(accountId: Int) {
+        if (forceStopDialogShowing || forceStopOtherInFlight) return
+        forceStopDialogShowing = true
+        setStatusText("设备正被其他账户使用")
+        AlertDialog.Builder(this)
+            .setTitle("设备正在被其他账户使用")
+            .setMessage(
+                "当前设备属于其他账户" + (if (accountId > 0) "（账号 $accountId）" else "") + "。\n" +
+                    "可以断开连接，或强制关闭对方用水。\n\n" +
+                    "强制停止会让对方立即断水，请确认设备确实无人使用。"
+            )
+            .setPositiveButton("强制停止对方用水") { _, _ ->
+                forceStopDialogShowing = false
+                forceStopOtherWater()
+            }
+            .setNegativeButton("断开连接") { _, _ ->
+                forceStopDialogShowing = false
+                setStatusText("设备正被其他账户使用，已断开")
+                releaseDevice("设备被其他账户使用")
+            }
+            .setOnCancelListener {
+                forceStopDialogShowing = false
+                setStatusText("设备正被其他账户使用，已断开")
+                releaseDevice("设备被其他账户使用")
+            }
+            .show()
+    }
+
+    private fun forceStopOtherWater() {
+        forceStopOtherInFlight = true
+        forceStopAttempts = 0
+        setStatusText("正在强制停止他人用水…")
+        Logger.log("用户选择强制停止他人用水，发送 0x22")
+        ble.send(0x22)
+        startForceStopTimeout()
+    }
+
     private fun confirmValveClosed(collect: Boolean) {
         opHandler.removeCallbacks(stopAckTimeout)
         opHandler.removeCallbacks(stopVerifyTimeout)
@@ -804,6 +884,13 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
             collectRequested = false
             setStatusText("已关阀")
             if (authInvalidPending) goToLogin("设备已关阀，请重新登录") else loadWallet()
+            // 用完就释放：不要一直占着水表，否则别人连不上
+            opHandler.postDelayed({
+                if (connected) {
+                    releaseDevice("已关阀")
+                    setStatusText("已关阀 · 已释放设备")
+                }
+            }, RELEASE_DEVICE_DELAY_MS)
             return
         }
         if (authInvalidPending) {
@@ -1182,7 +1269,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                     startRequestInFlight = false
                     verifyingStart = false
                     stopRequestInFlight = false
-                    setStatusText("连接中断，请重连原设备核对")
+                    setStatusText("连接中断 · 点「连接设备」重新连接")
                 } else {
                     setStatusText("已断开")
                 }
@@ -1232,8 +1319,25 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
             }
             0x22 -> {
                 if (payload.isNotEmpty() && (payload[0].toInt() and 0xFF) == 0x80) {
+                    if (forceStopOtherInFlight) {
+                        opHandler.removeCallbacks(forceStopTimeout)
+                        forceStopOtherInFlight = false
+                        Logger.log("已强制关阀（他人会话），不代结算")
+                        toast("已强制停止对方用水")
+                        deviceState = 0
+                        deviceAccountId = 0
+                        settlementInFlight = false
+                        collectRequested = false
+                        setStatusText("已强制停止他人用水 · 已释放设备")
+                        releaseDevice("强制停止他人用水")
+                        return
+                    }
                     Logger.log("设备已确认关阀")
                     confirmValveClosed(collect = true)
+                } else if (forceStopOtherInFlight) {
+                    Logger.log("设备拒绝强制关阀，准备重试")
+                    opHandler.removeCallbacks(forceStopTimeout)
+                    opHandler.post(forceStopTimeout)
                 } else if (stopRequestInFlight) {
                     Logger.log("设备拒绝关阀，立即进入重试")
                     opHandler.removeCallbacks(stopAckTimeout)
@@ -1253,13 +1357,22 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                     Logger.status("已关阀 · 结算完成")
                     setStatusText("已关阀 · 结算完成")
                     loadWallet()
-                    opHandler.postDelayed({ if (connected) ble.send(0x23) }, 500L)
+                    // 结算完成即释放设备，不再长时间占用水表（否则别人连不上）
+                    opHandler.postDelayed({
+                        if (connected) {
+                            releaseDevice("结算完成")
+                            setStatusText("结算完成 · 已释放设备")
+                        }
+                    }, RELEASE_DEVICE_DELAY_MS)
                 } else {
                     Logger.log("存储写回失败 payload=" + FrameUtils.toHex(payload))
                     settlementInFlight = false
                     collectRequested = false
                     setStatusText("已停止供水")
                     settlePending = true
+                    opHandler.postDelayed({
+                        if (connected) releaseDevice("设备记录待下次清除")
+                    }, RELEASE_DEVICE_DELAY_MS)
                 }
             }
             0xF8, 0x50 -> Logger.log("密钥设置回执")
@@ -1394,8 +1507,27 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
 
         when (state) {
             0 -> setStatusText("空闲（可开始）")
-            1 -> setStatusText(if (isOwnActiveSession()) "使用中" else "其他账户使用中")
-            3 -> confirmValveClosed(collect = true)
+            1 -> {
+                if (isOwnActiveSession()) {
+                    setStatusText("使用中")
+                } else {
+                    // 别人正在用：不直接断开，弹窗让用户决定「断开」还是「强制停止对方」
+                    Logger.log("设备被其他账户占用（accountId=" + accountId + "），弹出强制停止确认")
+                    showForceStopDialog(accountId)
+                    return
+                }
+            }
+            3, 6 -> {
+                // 遗留记录如果不是自己账户的，不代别人结算（会报 226，甚至账目错乱）
+                if (accountId > 0 && accountId != myAccountId()) {
+                    Logger.log("设备遗留记录属于其他账户（accountId=" + accountId + "），不代结算")
+                    setStatusText("设备留有他人的未结算记录，请让原使用者连接结算")
+                    toast("设备留有他人的未结算记录，已断开")
+                    releaseDevice("他人遗留记录")
+                    return
+                }
+                confirmValveClosed(collect = true)
+            }
             else -> setStatusText(stateText(state))
         }
         updateActionButtons()
@@ -1407,6 +1539,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         2 -> "不可中断"
         3 -> "有遗留数据"
         5 -> "受控模式"
+        6 -> "有遗留数据(6)"
         else -> "状态=" + s
     }
 
@@ -1541,6 +1674,10 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         Logger.status("已停止供水 · 待下次连接结算")
         setStatusText("已停止供水")
         updateActionButtons()
+        // 结算没成功也不要占着设备，释放后别人才能连；下次连接自动补结算
+        opHandler.postDelayed({
+            if (connected) releaseDevice("结算待下次连接")
+        }, RELEASE_DEVICE_DELAY_MS)
     }
 
     override fun onDestroy() {
@@ -1561,6 +1698,8 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         private const val STOP_ACK_TIMEOUT_MS = 1_600L
         private const val STOP_VERIFY_TIMEOUT_MS = 2_500L
         private const val MAX_STOP_ATTEMPTS = 2
+        private const val RELEASE_DEVICE_DELAY_MS = 1_200L
+        private const val FORCE_STOP_TIMEOUT_MS = 3_000L
         private const val SESSION_CHECK_INTERVAL_MS = 30_000L
 
         private const val LOG_REFRESH_MS = 1_500L
