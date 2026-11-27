@@ -109,6 +109,8 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     private var settlementInFlight = false
     private var collectRequested = false
     private var settlePending = false
+    /** 连接时先把设备上的遗留记录结算掉、好继续开阀（结算完不释放连接） */
+    private var settleForUse = false
     // 「设备被别人占用」弹窗与强制关阀状态
     private var forceStopDialogShowing = false
     private var forceStopOtherInFlight = false
@@ -505,6 +507,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         linkState = LinkState.SELECTED
         linkDetail = ""
         settlePending = false
+        settleForUse = false
         deviceState = -1
         deviceAccountId = 0
         randomNumber = ""
@@ -1281,6 +1284,13 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                 connected = false
                 DeviceDirectory.noteFail(this, selectedMac)
                 setStatusText(msg)
+                // 连不上且设备最近没广播 → 大概率被别人连着，给出可操作提示
+                if (!ble.wasSeenRecently(selectedMac)) {
+                    val hint = "连不上：设备最近没有广播，可能正被别人的手机连着。请让对方断开/退出 App 后再试"
+                    controlHintTv.text = hint
+                    toast("设备可能正被他人连接，请让对方断开后再试")
+                    Logger.log("连接失败且设备未广播，判定为可能被他人占用 mac=" + selectedMac)
+                }
             }
             BleManager.S_SCAN_DONE -> {
                 renderScanList()
@@ -1357,17 +1367,26 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                     Logger.status("已关阀 · 结算完成")
                     setStatusText("已关阀 · 结算完成")
                     loadWallet()
-                    // 结算完成即释放设备，不再长时间占用水表（否则别人连不上）
-                    opHandler.postDelayed({
-                        if (connected) {
-                            releaseDevice("结算完成")
-                            setStatusText("结算完成 · 已释放设备")
-                        }
-                    }, RELEASE_DEVICE_DELAY_MS)
+                    if (settleForUse) {
+                        // 这是“连接时先清遗留记录、随后继续开阀”的场景：不要释放连接
+                        settleForUse = false
+                        Logger.status("遗留记录已结算，设备空闲")
+                        setStatusText("遗留记录已结算 · 空闲（可开始）")
+                        opHandler.postDelayed({ if (connected) ble.send(0x23) }, 500L)
+                    } else {
+                        // 结算完成即释放设备，不再长时间占用水表（否则别人连不上）
+                        opHandler.postDelayed({
+                            if (connected) {
+                                releaseDevice("结算完成")
+                                setStatusText("结算完成 · 已释放设备")
+                            }
+                        }, RELEASE_DEVICE_DELAY_MS)
+                    }
                 } else {
                     Logger.log("存储写回失败 payload=" + FrameUtils.toHex(payload))
                     settlementInFlight = false
                     collectRequested = false
+                    settleForUse = false
                     setStatusText("已停止供水")
                     settlePending = true
                     opHandler.postDelayed({
@@ -1518,14 +1537,13 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                 }
             }
             3, 6 -> {
-                // 遗留记录如果不是自己账户的，不代别人结算（会报 226，甚至账目错乱）
+                // 设备上有未结算记录（对方当前并没连着，否则会是 state=1）。
+                // 不结算设备就不放行，所以这里先代为结算让设备回到空闲；结算失败再提示。
                 if (accountId > 0 && accountId != myAccountId()) {
-                    Logger.log("设备遗留记录属于其他账户（accountId=" + accountId + "），不代结算")
-                    setStatusText("设备留有他人的未结算记录，请让原使用者连接结算")
-                    toast("设备留有他人的未结算记录，已断开")
-                    releaseDevice("他人遗留记录")
-                    return
+                    Logger.log("设备留有他人未结算记录（accountId=" + accountId + "），先结算以释放设备")
+                    setStatusText("正在结算他人的遗留记录…")
                 }
+                settleForUse = true
                 confirmValveClosed(collect = true)
             }
             else -> setStatusText(stateText(state))
@@ -1635,8 +1653,12 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                             settlementInFlight = false
                             setStatusText("已停止供水")
                             settlePending = true
+                            settleForUse = false
                             Logger.log("结算响应无法解密或格式无效")
                             updateActionButtons()
+                            opHandler.postDelayed({
+                                if (connected) releaseDevice("写回数据无效")
+                            }, RELEASE_DEVICE_DELAY_MS)
                             return@runOnUiThread
                         }
                         // 服务器已接收消费数据，此时预扣不再属于“启动失败”订单。
@@ -1654,8 +1676,12 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                     collectRequested = false
                     setStatusText("已停止供水")
                     settlePending = true
+                    settleForUse = false
                     Logger.log("上传异常: " + e.message)
                     updateActionButtons()
+                    opHandler.postDelayed({
+                        if (connected) releaseDevice("上传异常")
+                    }, RELEASE_DEVICE_DELAY_MS)
                 }
             }
         }.start()
@@ -1671,6 +1697,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         settlementInFlight = false
         collectRequested = false
         settlePending = true
+        settleForUse = false
         Logger.status("已停止供水 · 待下次连接结算")
         setStatusText("已停止供水")
         updateActionButtons()

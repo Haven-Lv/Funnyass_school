@@ -13,8 +13,8 @@ android {
         applicationId = "com.funnyass.miuix"
         minSdk = 24
         targetSdk = 37
-        versionCode = 1922
-        versionName = "0.1922"
+        versionCode = 1924
+        versionName = "0.1924"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -50,6 +50,8 @@ class BleManager(private val ctx: Context) {
         const val S_SCAN_DONE = 11
 
         private const val CONNECT_TIMEOUT_MS = 15_000L
+        /** 设备最近没广播（多半被别人连着）时的短超时 */
+        private const val ABSENT_TIMEOUT_MS = 5_000L
         private const val STAGE_TIMEOUT_MS = 10_000L
         private const val MAX_ATTEMPTS = 2
         private const val RETRY_DELAY_MS = 1_500L
@@ -86,6 +88,19 @@ class BleManager(private val ctx: Context) {
      * 解决「断开后又被自动连回去」的问题。
      */
     @Volatile private var manualStop = false
+
+    /** 最近一次扫描里出现过的 MAC → 时间戳。用来区分「设备不在广播（被别人连着）」和「信号弱」 */
+    private val seenMacs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    fun wasSeenRecently(mac: String?, withinMs: Long = 30_000L): Boolean {
+        val key = (mac ?: "").trim().uppercase()
+        if (key.isEmpty()) return false
+        val t = seenMacs[key] ?: return false
+        return System.currentTimeMillis() - t <= withinMs
+    }
+
+    /** 本次连接使用的超时：没扫到就说明大概率被占用，别傻等 15 秒 */
+    @Volatile private var attemptTimeoutMs = CONNECT_TIMEOUT_MS
 
     val isEnabled: Boolean get() = adapter?.isEnabled == true
     val isConnected: Boolean get() = gatt != null && !connecting
@@ -132,6 +147,10 @@ class BleManager(private val ctx: Context) {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val dev = result.device ?: return
+            try {
+                seenMacs[dev.address.trim().uppercase()] = System.currentTimeMillis()
+            } catch (_: Exception) {
+            }
             // 广播里的名字优先：BluetoothDevice.name 只是系统缓存，未连接时经常为空
             val advertised = try {
                 result.scanRecord?.deviceName
@@ -185,7 +204,10 @@ class BleManager(private val ctx: Context) {
         closeGatt()
         attempt++
         val n = attempt
-        Logger.log("BLE 连接尝试 " + n + "/" + MAX_ATTEMPTS + " mac=" + dev.address)
+        // 设备最近没有广播（大概率被别人的手机连着）时用短超时，快速失败而不是干等 15 秒
+        attemptTimeoutMs = if (wasSeenRecently(dev.address)) CONNECT_TIMEOUT_MS else ABSENT_TIMEOUT_MS
+        Logger.log("BLE 连接尝试 " + n + "/" + MAX_ATTEMPTS + " mac=" + dev.address +
+            " 超时=" + attemptTimeoutMs + "ms 最近广播=" + (if (attemptTimeoutMs == CONNECT_TIMEOUT_MS) "有" else "无"))
         emit(if (n == 1) S_CONNECTING else S_RETRYING, "连接中…（第 " + n + " 次）")
         try {
             gatt = dev.connectGatt(ctx, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
@@ -200,14 +222,14 @@ class BleManager(private val ctx: Context) {
             return
         }
         main.removeCallbacks(connectTimeout)
-        main.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
+        main.postDelayed(connectTimeout, attemptTimeoutMs)
     }
 
     private val connectTimeout = Runnable {
         if (connecting) {
-            Logger.log("BLE 连接超时（" + CONNECT_TIMEOUT_MS + "ms）")
+            Logger.log("BLE 连接超时（" + attemptTimeoutMs + "ms）")
             closeGatt()
-            retryOrFail("连接超时")
+            retryOrFail(if (attemptTimeoutMs == ABSENT_TIMEOUT_MS) "设备无响应（可能正被他人连接）" else "连接超时")
         }
     }
 
